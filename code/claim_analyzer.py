@@ -5,6 +5,36 @@ import io
 import json
 from typing import Optional
 
+ALLOWED_ISSUES = {
+    "dent", "scratch", "crack", "glass_shatter", "broken_part",
+    "missing_part", "torn_packaging", "crushed_packaging",
+    "water_damage", "stain", "none", "unknown"
+}
+
+ALLOWED_SEVERITY = {"none", "low", "medium", "high", "unknown"}
+
+ALLOWED_RISK_FLAGS = {
+    "none", "blurry_image", "cropped_or_obstructed", "low_light_or_glare",
+    "wrong_angle", "wrong_object", "wrong_object_part", "damage_not_visible",
+    "claim_mismatch", "possible_manipulation", "non_original_image",
+    "text_instruction_present", "user_history_risk", "manual_review_required"
+}
+
+ALLOWED_PARTS = {
+    "car": {
+        "front_bumper", "rear_bumper", "door", "hood", "windshield",
+        "side_mirror", "headlight", "taillight", "fender",
+        "quarter_panel", "body", "unknown"
+    },
+    "laptop": {
+        "screen", "keyboard", "trackpad", "hinge", "lid",
+        "corner", "port", "base", "body", "unknown"
+    },
+    "package": {
+        "box", "package_corner", "package_side", "seal",
+        "label", "contents", "item", "unknown"
+    }
+}
 
 class ClaimAnalyzer:
     """Load images and analyze them with Anthropic when available."""
@@ -76,27 +106,54 @@ class ClaimAnalyzer:
         if self.client and self.model:
             # print(f"DEBUG: Calling Claude with model={self.model}, claim_object={claim_object}")
             # print(f"DEBUG: Image b64 length={len(image_b64) if image_b64 else 0}")
-            prompt = (
-                "Analyze this image for a damage claim. Return only valid JSON with keys:\n"
-    "- visible_object_type\n"
-    "- object_visible\n"
-    "- claimed_part_visible\n"
-    "- damage_visible\n"
-    "- issue_type\n"
-    "- object_part\n"
-    "- quality_assessment\n"
-    "- risk_flags\n"
-    "- severity\n"
-    "- visual_justification\n\n"
-    f"Claim object: {claim_object}\n"
-    f"User claim: {user_claim}\n\n"
-    "Allowed issue_type values: dent, scratch, crack, glass_shatter, broken_part, "
-    "missing_part, torn_packaging, crushed_packaging, water_damage, stain, none, unknown.\n"
-    "Allowed severity values: none, minor, moderate, severe, unknown.\n"
-    "quality_assessment should be one of: clear, blurry, cropped_or_obstructed, "
-    "low_light_or_glare, wrong_angle, non_original_image, unknown.\n"
-    "risk_flags should be a semicolon-separated string or none.\n"
-    "Use the image as the primary source of truth. Do not assume damage that is not visible."
+            prompt = (f"""
+You are analyzing an image for a damage claim.
+
+Return ONLY valid JSON. Do not include markdown or explanation outside JSON.
+
+User claim:
+{user_claim}
+
+Claim object:
+{claim_object}
+
+Use the image as the primary source of truth.
+
+Return this JSON schema:
+{{
+  "visible_object_type": "car|laptop|package|unknown",
+  "object_visible": true or false,
+  "claimed_part_visible": true or false,
+  "damage_visible": true or false,
+  "issue_type": "dent|scratch|crack|glass_shatter|broken_part|missing_part|torn_packaging|crushed_packaging|water_damage|stain|none|unknown",
+  "object_part": "one allowed object_part value",
+  "quality_assessment": "clear|blurry_image|cropped_or_obstructed|low_light_or_glare|wrong_angle|non_original_image|unknown",
+  "risk_flags": "semicolon-separated allowed risk flags, or none",
+  "severity": "none|low|medium|high|unknown",
+  "visual_justification": "short image-grounded explanation"
+}}
+
+Allowed car object_part values:
+front_bumper, rear_bumper, door, hood, windshield, side_mirror, headlight, taillight, fender, quarter_panel, body, unknown
+
+Allowed laptop object_part values:
+screen, keyboard, trackpad, hinge, lid, corner, port, base, body, unknown
+
+Allowed package object_part values:
+box, package_corner, package_side, seal, label, contents, item, unknown
+
+Allowed risk_flags:
+none, blurry_image, cropped_or_obstructed, low_light_or_glare, wrong_angle, wrong_object, wrong_object_part, damage_not_visible, claim_mismatch, possible_manipulation, non_original_image, text_instruction_present, user_history_risk, manual_review_required
+
+Important rules:
+- object_part must be exactly one allowed value.
+- issue_type must be exactly one allowed value.
+- severity must be exactly one allowed value.
+- risk_flags must only use allowed values.
+- If the relevant part is visible and no damage is present, use issue_type="none", damage_visible=false, and risk_flags="damage_not_visible".
+- If the issue cannot be determined, use issue_type="unknown".
+- Do not invent risk flags.
+"""
             )
             try:
                 response = self.client.messages.create(
@@ -137,3 +194,51 @@ class ClaimAnalyzer:
             "risk_flags": "none",
             "severity": "unknown",
         }
+
+def normalize_analysis(analysis, claim_object):
+    claim_object = str(claim_object).lower()
+
+    issue = str(analysis.get("issue_type", "unknown")).lower().strip()
+    if issue not in ALLOWED_ISSUES:
+        issue = "unknown"
+
+    severity = str(analysis.get("severity", "unknown")).lower().strip()
+    if severity == "minor":
+        severity = "low"
+    elif severity == "moderate":
+        severity = "medium"
+    elif severity == "severe":
+        severity = "high"
+    elif severity not in ALLOWED_SEVERITY:
+        severity = "unknown"
+
+    part = str(analysis.get("object_part", "unknown")).lower().strip()
+    part = part.replace(" ", "_")
+
+    allowed_parts = ALLOWED_PARTS.get(claim_object, {"unknown"})
+    if part not in allowed_parts:
+        part = "unknown"
+
+    raw_flags = str(analysis.get("risk_flags", "none")).lower()
+    flags = set()
+
+    for flag in raw_flags.split(";"):
+        flag = flag.strip().replace(" ", "_")
+
+        # common model outputs mapped to allowed values
+        if flag in {"no_visible_damage", "damage_absent"}:
+            flag = "damage_not_visible"
+        if flag in {"motion_blur", "vehicle_in_motion"}:
+            flag = "wrong_angle"
+
+        if flag in ALLOWED_RISK_FLAGS and flag != "none":
+            flags.add(flag)
+
+    risk_flags = ";".join(sorted(flags)) if flags else "none"
+
+    analysis["issue_type"] = issue
+    analysis["severity"] = severity
+    analysis["object_part"] = part
+    analysis["risk_flags"] = risk_flags
+
+    return analysis

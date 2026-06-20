@@ -3,8 +3,9 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import anthropic
-from claim_analyzer import ClaimAnalyzer
+from claim_analyzer import ClaimAnalyzer, normalize_analysis
 from decision_logic import determine_claim_status
+from parser import parse_claim
     
 root = Path(__file__).resolve().parents[1]
 load_dotenv(root / ".env")
@@ -48,13 +49,8 @@ def resolve_image_path(root, dataset_dir, img_rel):
     img_rel = str(img_rel).strip()
     rel_path = Path(img_rel)
     candidates = [
-        root / rel_path,
-        dataset_dir / rel_path,
-        dataset_dir / "images" / rel_path,
         dataset_dir / "images" / "sample" / rel_path,
-        dataset_dir / "images" / "test" / rel_path,
-        dataset_dir / "images" / "sample" / rel_path.name,
-        dataset_dir / "images" / "test" / rel_path.name,
+        # dataset_dir / "images" / "test" / rel_path,
     ]
 
     for path in candidates:
@@ -63,17 +59,37 @@ def resolve_image_path(root, dataset_dir, img_rel):
 
     return None
 
+def combine_flags(*flag_strings):
+    flags = set()
+    for flag_string in flag_strings:
+        if not isinstance(flag_string, str):
+            continue
+
+        for flag in flag_string.split(";"):
+            flag = flag.strip()
+
+            if flag and flag.lower() != "none":
+                flags.add(flag)
+            
+    return ";".join(sorted(flags)) if flags else "none"
+
 def main():
     dataset_dir = root / "dataset"
     claims = pd.read_csv(dataset_dir / "claims.csv")
     history = pd.read_csv(dataset_dir / "user_history.csv")
     requirements = pd.read_csv(dataset_dir / "evidence_requirements.csv")
+    history_by_user = history.set_index("user_id").to_dict("index")
+
     rows = []
     client, model = get_anthropic_client()
 
     analyzer = ClaimAnalyzer(client=client, model=model) if ClaimAnalyzer else None
 
     for _, claim in claims.iterrows():
+        parsed_claim = parse_claim( claim.get("user_claim", ""), claim.get("claim_object", ""))
+        user_history = history_by_user.get(claim["user_id"], {})
+        history_flags = user_history.get("history_flags", "none")
+        claim_text_flag = ("text_instruction_present" if parsed_claim.get("text_instruction_present") else "none")
         image_paths = str(claim.get("image_paths", ""))
         imgs = [p.strip() for p in image_paths.split(";") if p.strip()]
 
@@ -108,6 +124,7 @@ def main():
                     "risk_flags": "none",
                     "severity": "unknown",
                 }
+            result = normalize_analysis(result, claim.get("claim_object"))
             analysis = result
             print("Analysis:", analysis)
             img_id = Path(img_rel).stem
@@ -116,7 +133,12 @@ def main():
             break
 
         evidence_met = "true" if analysis.get("quality_assessment", "") in ["clear", "good", "clear_image", "clear"] and valid_image else "false"
-        claim_status, claim_status_justification = determine_claim_status(claim, analysis, valid_image, evidence_met,)
+        claim_status, claim_status_justification = determine_claim_status(claim, parsed_claim, analysis, valid_image, evidence_met,)
+        combined_risk_flags = combine_flags(
+    analysis.get("risk_flags", "none"),
+    history_flags,
+    claim_text_flag,
+)
         evidence_reason = "Image quality acceptable" if evidence_met == "true" else "Insufficient image quality or missing images"
 
         row = {
@@ -126,7 +148,7 @@ def main():
             "claim_object": claim["claim_object"],
             "evidence_standard_met": evidence_met,
             "evidence_standard_met_reason": evidence_reason,
-            "risk_flags": analysis.get("risk_flags", "none"),
+            "risk_flags": combined_risk_flags,
             "issue_type": analysis.get("issue_type", "unknown"),
             "object_part": analysis.get("object_part", "unknown"),
             "claim_status": claim_status,

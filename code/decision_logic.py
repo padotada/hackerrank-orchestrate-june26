@@ -1,22 +1,20 @@
-from parser import parse_claim
-def values_match(claimed, visible):
-    claimed = str(claimed).lower()
-    visible = str(visible).lower()
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).lower().strip() == "true"
 
-    if claimed in ["unknown", "none", ""]:
-        return True
 
-    if visible in ["unknown", "none", ""]:
-        return False
+def compatible_issue(claimed, visible):
+    if claimed in {"unknown", "", "none"}:
+        return visible not in {"unknown", ""}
 
     if claimed == visible:
         return True
 
-    # Allow some nearby matches
     compatible = {
         "crack": {"glass_shatter", "broken_part"},
         "glass_shatter": {"crack", "broken_part"},
-        "scratch": {"stain"},
+        "broken_part": {"crack", "glass_shatter", "missing_part"},
         "torn_packaging": {"crushed_packaging"},
         "crushed_packaging": {"torn_packaging"},
     }
@@ -24,62 +22,60 @@ def values_match(claimed, visible):
     return visible in compatible.get(claimed, set())
 
 
-def determine_claim_status(claim, analysis, valid_image, evidence_met):
+def determine_claim_status(claim, parsed_claim, analysis, valid_image, evidence_met):
     if not valid_image:
         return (
             "not_enough_information",
-            "No valid image could be loaded for visual review."
+            "No valid image could be loaded for automated review."
         )
 
     if evidence_met != "true":
         return (
             "not_enough_information",
-            "Image evidence does not meet the minimum visibility or quality standard."
+            "The submitted image is not sufficient to evaluate the claimed damage."
         )
 
-    parsed = parse_claim(claim.get("user_claim", ""))
-
-    claimed_issue = parsed["claimed_issue_type"]
-    claimed_part = parsed["claimed_object_part"]
+    risk_flags = str(analysis.get("risk_flags", "none")).lower()
+    claimed_issue = parsed_claim["claimed_issue_type"]
+    claimed_part = parsed_claim["claimed_object_part"]
 
     visible_issue = str(analysis.get("issue_type", "unknown")).lower()
     visible_part = str(analysis.get("object_part", "unknown")).lower()
-    risk_flags = str(analysis.get("risk_flags", "none")).lower()
+
+    claimed_part_visible = to_bool(analysis.get("claimed_part_visible", False))
+    damage_visible = to_bool(analysis.get("damage_visible", False))
 
     if "wrong_object" in risk_flags:
         return (
             "contradicted",
-            "The image appears to show the wrong object type for this claim."
+            "The submitted image appears to show a different object than the claim describes."
         )
 
-    if "damage_not_visible" in risk_flags and visible_part == claimed_part:
+    if not claimed_part_visible:
+        return (
+            "not_enough_information",
+            "The image does not clearly show the claimed object part."
+        )
+
+    if claimed_part_visible and not damage_visible:
         return (
             "contradicted",
             "The claimed object part is visible, but the claimed damage is not visible."
         )
 
-    part_matches = values_match(claimed_part, visible_part)
-    issue_matches = values_match(claimed_issue, visible_issue)
+    if damage_visible and visible_issue not in {"none", "unknown", ""}:
+        if compatible_issue(claimed_issue, visible_issue):
+            return (
+                "supported",
+                f"The image shows visible {visible_issue} on the {visible_part}, matching the claim."
+            )
 
-    if visible_issue not in ["unknown", "none", ""] and part_matches and issue_matches:
-        return (
-            "supported",
-            f"The image shows visible {visible_issue} on the {visible_part}, matching the user's claim."
-        )
-
-    if visible_issue not in ["unknown", "none", ""] and not issue_matches:
         return (
             "contradicted",
-            f"The image shows {visible_issue}, but the user claimed {claimed_issue}."
-        )
-
-    if visible_part not in ["unknown", "none", ""] and not part_matches:
-        return (
-            "not_enough_information",
-            f"The image shows the {visible_part}, but the claimed part appears to be {claimed_part}."
+            f"The image shows {visible_issue}, but the claim describes {claimed_issue}."
         )
 
     return (
         "not_enough_information",
-        "The image was reviewed, but the relevant claimed damage could not be verified."
+        "The image was reviewed, but the visible evidence was not enough to verify the claim."
     )

@@ -3,26 +3,22 @@ from PIL import Image
 import base64
 import io
 import json
+from typing import Optional
+
 
 class ClaimAnalyzer:
-    """Load images, parse claims, and analyze images using Anthropic when available.
+    """Load images and analyze them with Anthropic when available."""
 
-    Methods:
-    - load_image(path): returns base64 JPEG bytes or None
-    - analyze_image(image_b64, claim_object=None): returns dict with keys
-      issue_type, object_part, quality_assessment, risk_flags, severity
-    """
     def __init__(self, client=None, model=None):
         self.client = client
         self.model = model
 
     def parse_claim(self, user_claim: str) -> str:
-        # Lightweight parser (placeholder). Return the claim text normalized.
         if not isinstance(user_claim, str):
             return ""
         return user_claim.strip()
 
-    def load_image(self, path) -> str | None:
+    def load_image(self, path) -> Optional[str]:
         p = Path(path)
         if not p.exists():
             return None
@@ -32,22 +28,41 @@ class ClaimAnalyzer:
             img.save(buf, format="JPEG")
             return base64.b64encode(buf.getvalue()).decode("utf-8")
         except Exception:
+            print("Image didn't exist")
             return None
 
+    def _extract_text(self, response) -> str:
+        if response is None:
+            return ""
+        content = getattr(response, "content", None)
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    parts.append(getattr(block, "text", ""))
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            if parts:
+                return "\n".join(parts)
+        if isinstance(content, str):
+            return content
+        completion = getattr(response, "completion", None)
+        if isinstance(completion, str):
+            return completion
+        return str(response)
+
     def _parse_model_response(self, text: str) -> dict:
-        # Try to recover JSON from the model response
         try:
             return json.loads(text)
         except Exception:
-            # best-effort: look for first { ... } block
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
                 try:
-                    return json.loads(text[start:end+1])
+                    return json.loads(text[start : end + 1])
                 except Exception:
                     pass
-        # fallback minimal structure
         return {
             "issue_type": "unknown",
             "object_part": "unknown",
@@ -57,33 +72,55 @@ class ClaimAnalyzer:
             "raw_text": text,
         }
 
-    def analyze_image(self, image_b64: str, claim_object: str | None = None) -> dict:
-        # If Anthropic client available, call it with a structured prompt
+    def analyze_image(self, image_b64: str, claim_object: Optional[str] = None, user_claim = None) -> dict:
         if self.client and self.model:
+            # print(f"DEBUG: Calling Claude with model={self.model}, claim_object={claim_object}")
+            # print(f"DEBUG: Image b64 length={len(image_b64) if image_b64 else 0}")
             prompt = (
-                "You are an assistant that analyzes a single image for damage claims.\n"
-                "Return a JSON object with keys: issue_type, object_part, quality_assessment, risk_flags, severity.\n"
-                f"Claim object: {claim_object}\n"
-                "Image is provided as base64 JPEG. You do not need to decode it; rely on visual analysis capabilities.\n"
-                "Respond only with JSON.\n"
-                "Image (first 512 chars, truncated):\n"
-                + image_b64[:512]
+                "Analyze this image for a damage claim. Return only valid JSON with keys:\n"
+    "- visible_object_type\n"
+    "- object_visible\n"
+    "- claimed_part_visible\n"
+    "- damage_visible\n"
+    "- issue_type\n"
+    "- object_part\n"
+    "- quality_assessment\n"
+    "- risk_flags\n"
+    "- severity\n"
+    "- visual_justification\n\n"
+    f"Claim object: {claim_object}\n"
+    f"User claim: {user_claim}\n\n"
+    "Allowed issue_type values: dent, scratch, crack, glass_shatter, broken_part, "
+    "missing_part, torn_packaging, crushed_packaging, water_damage, stain, none, unknown.\n"
+    "Allowed severity values: none, minor, moderate, severe, unknown.\n"
+    "quality_assessment should be one of: clear, blurry, cropped_or_obstructed, "
+    "low_light_or_glare, wrong_angle, non_original_image, unknown.\n"
+    "risk_flags should be a semicolon-separated string or none.\n"
+    "Use the image as the primary source of truth. Do not assume damage that is not visible."
             )
             try:
-                resp = self.client.messages.create(
+                response = self.client.messages.create(
                     model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=512,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": image_b64,
+                                    },
+                                },
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ],
                 )
-                # Attempt to extract a text completion from possible response shapes
-                text = ""
-                if isinstance(resp, dict):
-                    text = resp.get("completion") or resp.get("content") or str(resp)
-                else:
-                    # Some SDKs attach .content or .completion
-                    text = getattr(resp, "completion", None) or getattr(resp, "content", None) or str(resp)
-                parsed = self._parse_model_response(text)
-                return parsed
+                text = self._extract_text(response)
+                return self._parse_model_response(text)
             except Exception as e:
                 return {
                     "issue_type": "unknown",
@@ -93,7 +130,6 @@ class ClaimAnalyzer:
                     "severity": "unknown",
                     "error": str(e),
                 }
-        # Fallback heuristic when no model available
         return {
             "issue_type": "unknown",
             "object_part": "unknown",

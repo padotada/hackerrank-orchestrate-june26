@@ -2,3 +2,5 @@
 output.csv
 .env
 /code/__pycache__
+/submission
+/submission.*

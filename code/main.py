@@ -49,8 +49,11 @@ def resolve_image_path(root, dataset_dir, img_rel):
     img_rel = str(img_rel).strip()
     rel_path = Path(img_rel)
     candidates = [
-        dataset_dir / "images" / "sample" / rel_path,
-        # dataset_dir / "images" / "test" / rel_path,
+        root / rel_path,
+        dataset_dir / rel_path,
+        dataset_dir / "images" / rel_path,
+        dataset_dir / "images" / "test" / rel_path,
+        dataset_dir / "images" / "test" / rel_path.name,
     ]
 
     for path in candidates:
